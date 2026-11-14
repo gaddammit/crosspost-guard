@@ -40,6 +40,9 @@ WINDOW_SECONDS = float(os.environ.get("WINDOW_SECONDS", "30"))
 ACTION = os.environ.get("ACTION", "softban").strip().lower()
 if ACTION not in {"softban", "timeout"}:
     raise SystemExit(f"ACTION must be 'softban' or 'timeout', not {ACTION!r}.")
+ACTION_VERB = {"softban": "softbanned", "timeout": "timed out"}
+# What the report says the account was doing, as in "was softbanned for ...".
+FLAVOR = os.environ.get("FLAVOR", "Mr. Beast-ing")
 # Softban only: how far back Discord purges the account's messages.
 PURGE_MINUTES = float(os.environ.get("PURGE_MINUTES", "10"))
 # Timeout only: how long. Discord's maximum is 28 days.
@@ -178,38 +181,51 @@ async def on_message(message: discord.Message) -> None:
         await act(message, member, verdict)
 
 
-async def punish(member: discord.Member) -> str:
-    """Softban or time out the member and say what happened."""
+async def punish(member: discord.Member) -> tuple[str | None, str]:
+    """Softban or time out the member.
+
+    Returns what ended up happening to them ("softbanned", "timed out", "banned",
+    or None if nothing did) and a note for the report.
+    """
     reason = f"Posted in {CHANNEL_THRESHOLD}+ channels within {WINDOW_SECONDS:g}s"
 
     if ACTION == "timeout":
         try:
             await member.timeout(timedelta(hours=TIMEOUT_HOURS), reason=reason)
         except discord.HTTPException as exc:
-            return f"Could not time out: {exc.text or exc}"
-        return f"Timed out for {TIMEOUT_HOURS:g}h."
+            return None, f"Could not time out: {exc.text or exc}"
+        return "timed out", f"Timed out for {TIMEOUT_HOURS:g}h."
 
     try:
         await member.ban(delete_message_seconds=int(PURGE_MINUTES * 60), reason=reason)
     except discord.HTTPException as exc:
-        return f"Could not softban: {exc.text or exc}"
+        return None, f"Could not softban: {exc.text or exc}"
     try:
         await member.unban(reason="Softban: lifting the ban straight away")
     except discord.HTTPException as exc:
-        return f"Banned, but the ban could NOT be lifted, so unban them by hand: {exc.text or exc}"
-    return "Softbanned: removed from the server and free to rejoin with an invite."
+        return "banned", (
+            f"Banned, but the ban could NOT be lifted, so unban them by hand: {exc.text or exc}"
+        )
+    return "softbanned", "Softbanned: removed from the server and free to rejoin with an invite."
 
 
 async def act(message: discord.Message, member: discord.Member, verdict: Verdict) -> None:
     guild = message.guild
     notes: list[str] = []
+    headline = ""
 
     if DRY_RUN:
+        headline = f"{member.mention} would have been {ACTION_VERB[ACTION]} for {FLAVOR}"
         notes.append(f"Dry run: nothing was removed and no {ACTION} was applied.")
     else:
         # Deal with the account first so it stops posting while we clean up.
         if verdict.newly_flagged:
-            notes.append(await punish(member))
+            done, note = await punish(member)
+            notes.append(note)
+            if done:
+                headline = f"{member.mention} was {done} for {FLAVOR}"
+            else:
+                headline = f"{member.mention} was caught {FLAVOR}, but the {ACTION} failed"
 
         # A softban has Discord purge these too, so "already gone" counts as removed.
         removed = 0
@@ -228,11 +244,15 @@ async def act(message: discord.Message, member: discord.Member, verdict: Verdict
 
     log.info("Caught %s (%d) in %s: %s", member, member.id, guild.name, " ".join(notes))
     if verdict.newly_flagged:
-        await report(message, member, verdict, notes)
+        await report(message, member, verdict, notes, headline)
 
 
 async def report(
-    message: discord.Message, member: discord.Member, verdict: Verdict, notes: list[str]
+    message: discord.Message,
+    member: discord.Member,
+    verdict: Verdict,
+    notes: list[str],
+    headline: str,
 ) -> None:
     if LOG_CHANNEL_ID is None:
         return
@@ -245,7 +265,7 @@ async def report(
     names = [a.filename for a in message.attachments]
     embed = discord.Embed(
         title="Cross-channel spam caught",
-        description=f"{member.mention} (`{member}`, ID `{member.id}`)",
+        description=f"**{headline}**\n`{member}`, ID `{member.id}`",
         colour=discord.Colour.red(),
     )
     embed.add_field(name="Channels", value=" ".join(f"<#{c}>" for c in channels), inline=False)

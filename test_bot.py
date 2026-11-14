@@ -80,6 +80,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.member = MagicMock(spec=discord.Member)
         self.member.id = 7
+        self.member.mention = "<@7>"
         self.member.bot = False
         self.member.roles = []
         self.member.guild_permissions = discord.Permissions.none()
@@ -120,6 +121,40 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
     def report_result(self):
         return self.channels[999].send.await_args.kwargs["embed"].fields[-1].value
+
+    def headline(self):
+        return self.channels[999].send.await_args.kwargs["embed"].description.splitlines()[0]
+
+    async def test_headline_says_what_happened(self):
+        with patch.object(bot, "ACTION", "softban"):
+            await self.spam()
+        self.assertEqual(self.headline(), "**<@7> was softbanned for Mr. Beast-ing**")
+
+    async def test_headline_for_timeout_and_custom_flavor(self):
+        with patch.object(bot, "FLAVOR", "spamming"):
+            await self.spam()
+        self.assertEqual(self.headline(), "**<@7> was timed out for spamming**")
+
+    async def test_headline_for_dry_run(self):
+        with patch.multiple(bot, ACTION="softban", DRY_RUN=True):
+            await self.spam()
+        self.assertEqual(self.headline(), "**<@7> would have been softbanned for Mr. Beast-ing**")
+
+    async def test_headline_when_the_softban_fails(self):
+        response = MagicMock(status=403, reason="Forbidden")
+        self.member.ban.side_effect = discord.Forbidden(response, "Missing Permissions")
+        with patch.object(bot, "ACTION", "softban"):
+            await self.spam()
+        self.assertEqual(
+            self.headline(), "**<@7> was caught Mr. Beast-ing, but the softban failed**"
+        )
+
+    async def test_headline_when_the_ban_could_not_be_lifted(self):
+        response = MagicMock(status=500, reason="Server Error")
+        self.member.unban.side_effect = discord.HTTPException(response, "boom")
+        with patch.object(bot, "ACTION", "softban"):
+            await self.spam()
+        self.assertEqual(self.headline(), "**<@7> was banned for Mr. Beast-ing**")
 
     async def test_softban_bans_purges_and_unbans(self):
         with patch.multiple(bot, ACTION="softban", PURGE_MINUTES=10):

@@ -66,6 +66,7 @@ All are environment variables. Only `DISCORD_TOKEN` is required.
 | `CHANNEL_THRESHOLD` | `3` | How many different channels count as spam. |
 | `WINDOW_SECONDS` | `30` | How quickly those posts have to happen. |
 | `ACTION` | `softban` | `softban` or `timeout`. |
+| `FLAVOR` | `Mr. Beast-ing` | What the report says they were doing, as in "was softbanned for Mr. Beast-ing". |
 | `PURGE_MINUTES` | `10` | Softban only: how far back Discord purges the account's messages. |
 | `TIMEOUT_HOURS` | `24` | Timeout only: how long. Discord's limit is 28 days (672). |
 | `COUNT_LINKS` | `1` | Also count messages that contain a link. Set `0` for attachments only. |
