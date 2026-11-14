@@ -97,11 +97,12 @@ the passphrase. On Windows, use `.venv\Scripts\python` instead.
 
 ## Settings
 
-All are environment variables. Only `DISCORD_TOKEN` is required.
+All are environment variables. Only the token is required: either `DISCORD_TOKEN` or the
+passphrase option above.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DISCORD_TOKEN` | none | The bot token. |
+| `DISCORD_TOKEN` | none | The bot token. Leave it unset if you use the passphrase option. |
 | `LOG_CHANNEL_ID` | none | Report channel for servers where `/modlog` hasn't been run. With neither, catches only appear in the console. |
 | `STATE_FILE` | `settings.json` | Where the `/modlog` choices and the `DAILY_LIMIT` count are saved. |
 | `TOKEN_FILE` | `token.enc` | Where the passphrase-protected token is kept, if you use that option. |
