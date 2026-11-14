@@ -84,9 +84,11 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.member.roles = []
         self.member.guild_permissions = discord.Permissions.none()
         self.member.timeout = AsyncMock()
+        self.member.ban = AsyncMock()
+        self.member.unban = AsyncMock()
 
         patcher = patch.multiple(
-            bot, tracker=SpamTracker(3, 30), LOG_CHANNEL_ID=999, DRY_RUN=False
+            bot, tracker=SpamTracker(3, 30), LOG_CHANNEL_ID=999, DRY_RUN=False, ACTION="timeout"
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -111,6 +113,51 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.member.timeout.assert_awaited_once()
         self.channels[103].get_partial_message.return_value.delete.assert_awaited_once()
         self.channels[999].send.assert_awaited_once()
+
+    async def spam(self):
+        for i, cid in enumerate((100, 101, 102)):
+            await self.post(cid, i)
+
+    def report_result(self):
+        return self.channels[999].send.await_args.kwargs["embed"].fields[-1].value
+
+    async def test_softban_bans_purges_and_unbans(self):
+        with patch.multiple(bot, ACTION="softban", PURGE_MINUTES=10):
+            await self.spam()
+        self.member.ban.assert_awaited_once()
+        self.assertEqual(self.member.ban.await_args.kwargs["delete_message_seconds"], 600)
+        self.member.unban.assert_awaited_once()
+        self.member.timeout.assert_not_awaited()
+        self.assertIn("Softbanned", self.report_result())
+
+    async def test_softban_counts_purged_messages_as_removed(self):
+        gone = discord.NotFound(MagicMock(status=404, reason="Not Found"), "Unknown Message")
+        for cid in (100, 101, 102):
+            self.guild.get_channel_or_thread(cid).get_partial_message.return_value.delete.side_effect = gone
+        with patch.object(bot, "ACTION", "softban"):
+            await self.spam()
+        self.assertIn("Removed 3 of 3", self.report_result())
+
+    async def test_softban_reports_a_ban_it_could_not_lift(self):
+        response = MagicMock(status=500, reason="Server Error")
+        self.member.unban.side_effect = discord.HTTPException(response, "boom")
+        with patch.object(bot, "ACTION", "softban"):
+            await self.spam()
+        self.assertIn("unban them by hand", self.report_result())
+
+    async def test_failed_softban_still_deletes(self):
+        response = MagicMock(status=403, reason="Forbidden")
+        self.member.ban.side_effect = discord.Forbidden(response, "Missing Permissions")
+        with patch.object(bot, "ACTION", "softban"):
+            await self.spam()
+        self.member.unban.assert_not_awaited()
+        self.channels[100].get_partial_message.return_value.delete.assert_awaited_once()
+        self.assertIn("Could not softban", self.report_result())
+
+    async def test_dry_run_does_not_softban(self):
+        with patch.multiple(bot, ACTION="softban", DRY_RUN=True):
+            await self.spam()
+        self.member.ban.assert_not_awaited()
 
     async def test_plain_text_is_ignored(self):
         for i, cid in enumerate((100, 101, 102, 103)):

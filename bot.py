@@ -1,6 +1,6 @@
 """Crosspost guard: catches one account posting attachments or links in several
 channels within a short window (the usual pattern of a hijacked account posting
-scam screenshots), times the account out, deletes the posts and tells the mods.
+scam screenshots), softbans the account, deletes the posts and tells the mods.
 
 Configuration is by environment variable; see README.md.
 """
@@ -34,7 +34,15 @@ def _ids(name: str) -> set[int]:
 # How many different channels, within how many seconds, counts as spam.
 CHANNEL_THRESHOLD = int(os.environ.get("CHANNEL_THRESHOLD", "3"))
 WINDOW_SECONDS = float(os.environ.get("WINDOW_SECONDS", "30"))
-# Timeout length. Discord's maximum is 28 days.
+# What to do to the account. "softban" bans and immediately unbans, which removes
+# it from the server and has Discord purge its recent messages. "timeout" keeps
+# it in the server but muted.
+ACTION = os.environ.get("ACTION", "softban").strip().lower()
+if ACTION not in {"softban", "timeout"}:
+    raise SystemExit(f"ACTION must be 'softban' or 'timeout', not {ACTION!r}.")
+# Softban only: how far back Discord purges the account's messages.
+PURGE_MINUTES = float(os.environ.get("PURGE_MINUTES", "10"))
+# Timeout only: how long. Discord's maximum is 28 days.
 TIMEOUT_HOURS = float(os.environ.get("TIMEOUT_HOURS", "24"))
 # Count messages that contain a link as well as ones with attachments.
 COUNT_LINKS = _flag("COUNT_LINKS", True)
@@ -45,7 +53,7 @@ LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0")) or None
 # Roles that are never checked. Members with Manage Messages are always skipped.
 EXEMPT_ROLE_IDS = _ids("EXEMPT_ROLE_IDS")
 # After a catch, keep deleting that account's matching posts for this long, in
-# case the timeout failed or messages were already in flight.
+# case the softban or timeout failed or messages were already in flight.
 FLAG_SECONDS = 300.0
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -143,11 +151,12 @@ tracker = SpamTracker(CHANNEL_THRESHOLD, WINDOW_SECONDS)
 @client.event
 async def on_ready() -> None:
     log.info(
-        "Logged in as %s. Watching %d server(s): %d channels in %gs%s",
+        "Logged in as %s. Watching %d server(s): %d channels in %gs gets a %s%s",
         client.user,
         len(client.guilds),
         CHANNEL_THRESHOLD,
         WINDOW_SECONDS,
+        ACTION,
         " (dry run)" if DRY_RUN else "",
     )
 
@@ -169,37 +178,53 @@ async def on_message(message: discord.Message) -> None:
         await act(message, member, verdict)
 
 
+async def punish(member: discord.Member) -> str:
+    """Softban or time out the member and say what happened."""
+    reason = f"Posted in {CHANNEL_THRESHOLD}+ channels within {WINDOW_SECONDS:g}s"
+
+    if ACTION == "timeout":
+        try:
+            await member.timeout(timedelta(hours=TIMEOUT_HOURS), reason=reason)
+        except discord.HTTPException as exc:
+            return f"Could not time out: {exc.text or exc}"
+        return f"Timed out for {TIMEOUT_HOURS:g}h."
+
+    try:
+        await member.ban(delete_message_seconds=int(PURGE_MINUTES * 60), reason=reason)
+    except discord.HTTPException as exc:
+        return f"Could not softban: {exc.text or exc}"
+    try:
+        await member.unban(reason="Softban: lifting the ban straight away")
+    except discord.HTTPException as exc:
+        return f"Banned, but the ban could NOT be lifted, so unban them by hand: {exc.text or exc}"
+    return "Softbanned: removed from the server and free to rejoin with an invite."
+
+
 async def act(message: discord.Message, member: discord.Member, verdict: Verdict) -> None:
     guild = message.guild
     notes: list[str] = []
 
     if DRY_RUN:
-        notes.append("Dry run: nothing was removed and nobody was timed out.")
+        notes.append(f"Dry run: nothing was removed and no {ACTION} was applied.")
     else:
-        # Time out first so the account stops posting while we clean up.
+        # Deal with the account first so it stops posting while we clean up.
         if verdict.newly_flagged:
-            try:
-                await member.timeout(
-                    timedelta(hours=TIMEOUT_HOURS),
-                    reason=f"Posted in {CHANNEL_THRESHOLD}+ channels within {WINDOW_SECONDS:g}s",
-                )
-                notes.append(f"Timed out for {TIMEOUT_HOURS:g}h.")
-            except discord.HTTPException as exc:
-                notes.append(f"Could not time out: {exc.text or exc}")
+            notes.append(await punish(member))
 
-        deleted = 0
+        # A softban has Discord purge these too, so "already gone" counts as removed.
+        removed = 0
         for hit in verdict.hits:
             channel = guild.get_channel_or_thread(hit.channel_id)
             if channel is None:
                 continue
             try:
                 await channel.get_partial_message(hit.message_id).delete()
-                deleted += 1
+                removed += 1
             except discord.NotFound:
-                pass  # already gone
+                removed += 1
             except discord.HTTPException as exc:
                 notes.append(f"Could not delete in <#{hit.channel_id}>: {exc.text or exc}")
-        notes.append(f"Deleted {deleted} of {len(verdict.hits)} message(s).")
+        notes.append(f"Removed {removed} of {len(verdict.hits)} message(s).")
 
     log.info("Caught %s (%d) in %s: %s", member, member.id, guild.name, " ".join(notes))
     if verdict.newly_flagged:
@@ -229,7 +254,11 @@ async def report(
     if names:
         embed.add_field(name="Attachments", value=", ".join(names)[:500], inline=False)
     embed.add_field(name="Result", value="\n".join(notes)[:1000], inline=False)
-    embed.set_footer(text="The account is probably hijacked. Lift the timeout once its owner has it back.")
+    if ACTION == "timeout":
+        footer = "The account is probably hijacked. Lift the timeout once its owner has it back."
+    else:
+        footer = "The account is probably hijacked. Its owner can rejoin with an invite once they have it back."
+    embed.set_footer(text=footer)
     try:
         await channel.send(embed=embed)
     except discord.HTTPException as exc:
