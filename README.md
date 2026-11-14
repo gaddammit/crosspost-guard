@@ -95,6 +95,25 @@ the passphrase. On Windows, use `.venv\Scripts\python` instead.
 - If you forget the passphrase, reset the token in the Developer Portal and run
   `--encrypt-token` again.
 
+## Optional: start automatically on Windows
+
+`start-bot.bat` loads `.env` (if there is one) and runs the bot in its own window. To
+have it start every time you log in to Windows:
+
+1. Open the `crosspost-guard` folder in File Explorer, right-click `start-bot.bat` and
+   choose **Create shortcut** (under **Show more options** on Windows 11).
+2. Press Win+R, type `shell:startup` and press Enter. This opens your Startup folder.
+3. Move the shortcut into that folder.
+
+To check it, double-click the shortcut: a window titled "Crosspost guard" should open
+and log in. To stop starting automatically, delete the shortcut from the Startup folder.
+
+- It starts when you log in, not when the PC switches on, and stops when you log out,
+  shut down or the PC sleeps.
+- With the passphrase option, the window waits for you to type the passphrase.
+- Closing the window stops the bot. To keep it out of the way, right-click the shortcut,
+  choose **Properties** and set **Run** to **Minimized**.
+
 ## Settings
 
 All are environment variables. Only the token is required: either `DISCORD_TOKEN` or the
