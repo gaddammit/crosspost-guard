@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import re
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 import discord
+from discord import app_commands
 
 log = logging.getLogger("crosspost-guard")
 
@@ -49,8 +52,11 @@ TIMEOUT_HOURS = float(os.environ.get("TIMEOUT_HOURS", "24"))
 COUNT_LINKS = _flag("COUNT_LINKS", True)
 # Report only: no timeout, no deletions.
 DRY_RUN = _flag("DRY_RUN", False)
-# Channel that receives a report for each catch (optional).
+# Channel that receives a report for each catch, for servers where nobody has
+# chosen one with /modlog (optional).
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0")) or None
+# Where the channels chosen with /modlog are remembered.
+STATE_FILE = Path(os.environ.get("STATE_FILE", "settings.json"))
 # Roles that are never checked. Members with Manage Messages are always skipped.
 EXEMPT_ROLE_IDS = _ids("EXEMPT_ROLE_IDS")
 # After a catch, keep deleting that account's matching posts for this long, in
@@ -125,6 +131,32 @@ class SpamTracker:
             del self._flagged[key]
 
 
+class Settings:
+    """Each server's report channel as chosen with /modlog, kept in a JSON file."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._log_channels: dict[int, int] = {}
+        try:
+            saved = json.loads(path.read_text())
+            self._log_channels = {int(g): int(c) for g, c in saved["log_channels"].items()}
+        except FileNotFoundError:
+            pass
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise SystemExit(f"{path} is damaged ({exc!r}). Fix it or delete it.") from exc
+
+    def log_channel_id(self, guild_id: int) -> int | None:
+        return self._log_channels.get(guild_id, LOG_CHANNEL_ID)
+
+    def set_log_channel(self, guild_id: int, channel_id: int) -> None:
+        self._log_channels[guild_id] = channel_id
+        saved = {"log_channels": {str(g): c for g, c in self._log_channels.items()}}
+        # Write beside the file and swap it in, so a crash can't leave it half-written.
+        scratch = self.path.with_name(self.path.name + ".tmp")
+        scratch.write_text(json.dumps(saved, indent=2) + "\n")
+        scratch.replace(self.path)
+
+
 def is_suspicious(message: discord.Message) -> bool:
     """True for messages that carry an attachment or (optionally) a link.
 
@@ -152,7 +184,66 @@ intents.guild_messages = True
 intents.message_content = True  # privileged: enable it in the Developer Portal
 
 client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+tree = app_commands.CommandTree(client)
 tracker = SpamTracker(CHANNEL_THRESHOLD, WINDOW_SECONDS)
+settings = Settings(STATE_FILE)
+
+
+@client.event
+async def setup_hook() -> None:
+    # Register /modlog with Discord. The guard still works if this fails.
+    try:
+        await tree.sync()
+    except discord.HTTPException as exc:
+        log.warning("Could not register the /modlog command: %s", exc)
+
+
+@tree.command(name="modlog", description="Choose where crosspost guard posts its reports.")
+@app_commands.describe(channel="Channel for reports. Leave empty to see the current one.")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def modlog(
+    interaction: discord.Interaction, channel: discord.TextChannel | None = None
+) -> None:
+    guild = interaction.guild
+
+    if channel is None:
+        current = settings.log_channel_id(guild.id)
+        if current is None:
+            text = "No report channel is set. Run `/modlog` with a channel to choose one."
+        else:
+            text = f"Reports go to <#{current}>."
+        await interaction.response.send_message(text, ephemeral=True)
+        return
+
+    # Prove the bot can post reports there before switching to it.
+    mine = channel.permissions_for(guild.me)
+    needed = {
+        "View Channel": mine.view_channel,
+        "Send Messages": mine.send_messages,
+        "Embed Links": mine.embed_links,
+    }
+    missing = [name for name, has in needed.items() if not has]
+    problem = f"I'm missing {', '.join(missing)} there" if missing else None
+    if problem is None:
+        try:
+            await channel.send(
+                f"Crosspost guard reports will be posted here (set by {interaction.user.mention})."
+            )
+        except discord.HTTPException as exc:
+            problem = f"Discord refused my test message ({exc.text or exc})"
+    if problem:
+        await interaction.response.send_message(
+            f"Nothing was changed: {problem}, so I can't report in {channel.mention}.",
+            ephemeral=True,
+        )
+        return
+
+    settings.set_log_channel(guild.id, channel.id)
+    log.info("%s set the report channel in %s to #%s", interaction.user, guild.name, channel.name)
+    await interaction.response.send_message(
+        f"Reports will now go to {channel.mention}.", ephemeral=True
+    )
 
 
 @client.event
@@ -261,11 +352,12 @@ async def report(
     notes: list[str],
     headline: str,
 ) -> None:
-    if LOG_CHANNEL_ID is None:
+    channel_id = settings.log_channel_id(message.guild.id)
+    if channel_id is None:
         return
-    channel = message.guild.get_channel_or_thread(LOG_CHANNEL_ID)
+    channel = message.guild.get_channel_or_thread(channel_id)
     if channel is None:
-        log.warning("LOG_CHANNEL_ID %d is not a channel in %s", LOG_CHANNEL_ID, message.guild.name)
+        log.warning("Report channel %d is not a channel in %s", channel_id, message.guild.name)
         return
 
     channels = sorted({h.channel_id for h in verdict.hits})

@@ -46,14 +46,31 @@ python3 -m venv .venv
 ```
 
 ```bash
-DISCORD_TOKEN=your-token LOG_CHANNEL_ID=123456789012345678 .venv/bin/python bot.py
+DISCORD_TOKEN=your-token .venv/bin/python bot.py
 ```
-
-To get a channel ID, turn on **Developer Mode** in Discord's Advanced settings, then
-right-click the channel and choose **Copy Channel ID**.
 
 Start with `DRY_RUN=1` for a few days if you want to see what it would catch before
 it acts on anyone.
+
+## 3. Choose the report channel
+
+In your server, run `/modlog` and pick a channel:
+
+```
+/modlog channel:#mod-log
+```
+
+The bot posts a test message there and, if that works, sends its reports there from
+then on. `/modlog` on its own shows the current channel. The choice is saved in
+`settings.json` next to `bot.py`, so it survives restarts.
+
+Only members with Manage Server can use the command. You can change that under
+**Server Settings > Integrations**. If the command doesn't show up, restart Discord;
+new commands can take a few minutes to appear.
+
+You can also set `LOG_CHANNEL_ID` instead. It is used for any server where nobody has
+run `/modlog`. To get a channel ID, turn on **Developer Mode** in Discord's Advanced
+settings, then right-click the channel and choose **Copy Channel ID**.
 
 ## Settings
 
@@ -62,7 +79,8 @@ All are environment variables. Only `DISCORD_TOKEN` is required.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DISCORD_TOKEN` | none | The bot token. |
-| `LOG_CHANNEL_ID` | none | Channel for reports. Without it, catches only appear in the console. |
+| `LOG_CHANNEL_ID` | none | Report channel for servers where `/modlog` hasn't been run. With neither, catches only appear in the console. |
+| `STATE_FILE` | `settings.json` | Where the `/modlog` choices are saved. |
 | `CHANNEL_THRESHOLD` | `3` | How many different channels count as spam. |
 | `WINDOW_SECONDS` | `30` | How quickly those posts have to happen. |
 | `ACTION` | `softban` | `softban` or `timeout`. |
@@ -81,7 +99,8 @@ All are environment variables. Only `DISCORD_TOKEN` is required.
   within 30 seconds will be caught too.
 - A softban purges everything the account posted in the last `PURGE_MINUTES`, not
   only the posts that triggered it.
-- The bot keeps its state in memory, so a restart forgets the last 30 seconds of posts.
+- Apart from the `/modlog` choice, the bot keeps its state in memory, so a restart
+  forgets the last 30 seconds of posts.
 
 ## Tests
 

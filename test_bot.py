@@ -1,12 +1,14 @@
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
 import bot
-from bot import SpamTracker
+from bot import Settings, SpamTracker
 
 
 class TrackerTests(unittest.TestCase):
@@ -100,8 +102,17 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.member.ban = AsyncMock()
         self.member.unban = AsyncMock()
 
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.settings = Settings(Path(folder.name) / "settings.json")
+
         patcher = patch.multiple(
-            bot, tracker=SpamTracker(3, 30), LOG_CHANNEL_ID=999, DRY_RUN=False, ACTION="timeout"
+            bot,
+            tracker=SpamTracker(3, 30),
+            settings=self.settings,
+            LOG_CHANNEL_ID=999,
+            DRY_RUN=False,
+            ACTION="timeout",
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -133,6 +144,12 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
     def report_result(self):
         return self.channels[999].send.await_args.kwargs["embed"].fields[-1].value
+
+    async def test_report_goes_to_the_channel_chosen_with_modlog(self):
+        self.settings.set_log_channel(self.guild.id, 555)
+        await self.spam()
+        self.channels[555].send.assert_awaited_once()
+        self.assertNotIn(999, self.channels)
 
     async def test_replayed_backlog_is_judged_by_post_time(self):
         # Three posts a minute apart, delivered back to back after a reconnect.
@@ -245,6 +262,91 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.channels[100].get_partial_message.return_value.delete.assert_awaited_once()
         report = self.channels[999].send.await_args.kwargs["embed"]
         self.assertIn("Could not time out", report.fields[-1].value)
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "settings.json"
+
+    def test_choice_survives_a_restart(self):
+        Settings(self.path).set_log_channel(1, 555)
+        self.assertEqual(Settings(self.path).log_channel_id(1), 555)
+
+    def test_other_servers_fall_back_to_the_environment_setting(self):
+        settings = Settings(self.path)
+        settings.set_log_channel(1, 555)
+        with patch.object(bot, "LOG_CHANNEL_ID", 999):
+            self.assertEqual(settings.log_channel_id(2), 999)
+        with patch.object(bot, "LOG_CHANNEL_ID", None):
+            self.assertIsNone(settings.log_channel_id(2))
+
+    def test_damaged_file_stops_startup(self):
+        self.path.write_text("{not json")
+        with self.assertRaises(SystemExit):
+            Settings(self.path)
+
+
+class ModlogCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.settings = Settings(Path(folder.name) / "settings.json")
+        patcher = patch.multiple(bot, settings=self.settings, LOG_CHANNEL_ID=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.interaction = MagicMock()
+        self.interaction.guild.id = 1
+        self.interaction.user.mention = "<@42>"
+        self.interaction.response.send_message = AsyncMock()
+
+        self.channel = MagicMock()
+        self.channel.id = 555
+        self.channel.mention = "<#555>"
+        self.channel.send = AsyncMock()
+        self.channel.permissions_for.return_value = discord.Permissions(
+            view_channel=True, send_messages=True, embed_links=True
+        )
+
+    async def run_command(self, channel=None):
+        await bot.modlog.callback(self.interaction, channel)
+        return self.interaction.response.send_message.await_args
+
+    async def test_setting_a_channel_posts_there_and_saves_it(self):
+        reply = await self.run_command(self.channel)
+        self.channel.send.assert_awaited_once()
+        self.assertEqual(self.settings.log_channel_id(1), 555)
+        self.assertIn("Reports will now go to <#555>", reply.args[0])
+        self.assertTrue(reply.kwargs["ephemeral"])
+
+    async def test_missing_permission_changes_nothing(self):
+        self.channel.permissions_for.return_value = discord.Permissions(
+            view_channel=True, send_messages=True
+        )
+        reply = await self.run_command(self.channel)
+        self.channel.send.assert_not_awaited()
+        self.assertIsNone(self.settings.log_channel_id(1))
+        self.assertIn("missing Embed Links", reply.args[0])
+
+    async def test_refused_test_message_changes_nothing(self):
+        response = MagicMock(status=403, reason="Forbidden")
+        self.channel.send.side_effect = discord.Forbidden(response, "Missing Access")
+        reply = await self.run_command(self.channel)
+        self.assertIsNone(self.settings.log_channel_id(1))
+        self.assertIn("Nothing was changed", reply.args[0])
+
+    async def test_no_argument_shows_the_current_channel(self):
+        reply = await self.run_command()
+        self.assertIn("No report channel is set", reply.args[0])
+        self.settings.set_log_channel(1, 555)
+        reply = await self.run_command()
+        self.assertIn("Reports go to <#555>", reply.args[0])
+
+    def test_command_is_limited_to_manage_server_and_servers(self):
+        self.assertTrue(bot.modlog.default_permissions.manage_guild)
+        self.assertTrue(bot.modlog.guild_only)
 
 
 if __name__ == "__main__":
