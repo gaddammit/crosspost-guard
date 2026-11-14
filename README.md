@@ -1,0 +1,2 @@
+# crosspost-guard
+Guarding crossposts
