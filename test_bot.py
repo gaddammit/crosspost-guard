@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -42,15 +43,26 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual([h.message_id for h in follow_up.hits], [9])
         self.assertIsNone(self.t.record(1, 7, 100, 10, now=400))
 
+    def test_out_of_order_arrival_goes_by_post_time(self):
+        self.assertIsNone(self.t.record(1, 7, 100, 1, now=100))
+        self.assertIsNone(self.t.record(1, 7, 101, 2, now=10))  # old message arriving late
+        self.assertIsNone(self.t.record(1, 7, 102, 3, now=105))
+        verdict = self.t.record(1, 7, 103, 4, now=110)
+        self.assertEqual([h.message_id for h in verdict.hits], [1, 3, 4])
+
     def test_sweep_drops_stale_entries(self):
         self.t.record(1, 7, 100, 1, now=0)
         self.t._sweep(now=1000)
         self.assertEqual(self.t._hits, {})
 
 
-def fake_message(member, guild, channel_id, message_id, attachments=1, content=""):
+START = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def fake_message(member, guild, channel_id, message_id, attachments=1, content="", age=0):
     return SimpleNamespace(
         id=message_id,
+        created_at=START + timedelta(seconds=age),
         guild=guild,
         author=member,
         webhook_id=None,
@@ -121,6 +133,13 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
     def report_result(self):
         return self.channels[999].send.await_args.kwargs["embed"].fields[-1].value
+
+    async def test_replayed_backlog_is_judged_by_post_time(self):
+        # Three posts a minute apart, delivered back to back after a reconnect.
+        for i, cid in enumerate((100, 101, 102)):
+            await self.post(cid, i, age=60 * i)
+        self.member.ban.assert_not_awaited()
+        self.member.timeout.assert_not_awaited()
 
     def headline(self):
         return self.channels[999].send.await_args.kwargs["embed"].description.splitlines()[0]

@@ -10,8 +10,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import time
-from collections import deque
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -82,7 +80,7 @@ class SpamTracker:
         self.threshold = threshold
         self.window = window
         self.flag_seconds = flag_seconds
-        self._hits: dict[tuple[int, int], deque[Hit]] = {}
+        self._hits: dict[tuple[int, int], list[Hit]] = {}
         self._flagged: dict[tuple[int, int], float] = {}
         self._records = 0
 
@@ -102,20 +100,26 @@ class SpamTracker:
                 return Verdict([hit], newly_flagged=False)
             del self._flagged[key]
 
-        hits = self._hits.setdefault(key, deque())
-        hits.append(hit)
-        while hits and now - hits[0].at > self.window:
-            hits.popleft()
+        # Keep only posts within one window of the newest. Messages can arrive
+        # late or out of order (Discord replays missed ones after a reconnect),
+        # so this goes by when they were posted, not by arrival order.
+        hits = [*self._hits.get(key, ()), hit]
+        newest = max(h.at for h in hits)
+        hits = [h for h in hits if newest - h.at <= self.window]
+        self._hits[key] = hits
 
         if len({h.channel_id for h in hits}) < self.threshold:
             return None
 
         del self._hits[key]
-        self._flagged[key] = now + self.flag_seconds
-        return Verdict(list(hits), newly_flagged=True)
+        self._flagged[key] = newest + self.flag_seconds
+        return Verdict(hits, newly_flagged=True)
 
     def _sweep(self, now: float) -> None:
-        for key in [k for k, v in self._hits.items() if not v or now - v[-1].at > self.window]:
+        stale = [
+            k for k, v in self._hits.items() if now - max(h.at for h in v) > self.window
+        ]
+        for key in stale:
             del self._hits[key]
         for key in [k for k, until in self._flagged.items() if now >= until]:
             del self._flagged[key]
@@ -174,8 +178,11 @@ async def on_message(message: discord.Message) -> None:
     if not is_suspicious(message):
         return
 
+    # Use the time Discord says the message was posted, not the time it reached
+    # us: after a reconnect, minutes of missed messages arrive within a second.
+    posted_at = message.created_at.timestamp()
     verdict = tracker.record(
-        message.guild.id, member.id, message.channel.id, message.id, time.monotonic()
+        message.guild.id, member.id, message.channel.id, message.id, posted_at
     )
     if verdict is not None:
         await act(message, member, verdict)
