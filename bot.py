@@ -355,7 +355,8 @@ async def punish(member: discord.Member) -> tuple[str | None, str]:
 
 async def act(message: discord.Message, member: discord.Member, verdict: Verdict) -> None:
     guild = message.guild
-    notes: list[str] = []
+    notes: list[str] = []  # what happened, for the console
+    problems: list[str] = []  # what a moderator has to deal with, for the report too
     headline = ""
 
     if DRY_RUN:
@@ -370,14 +371,14 @@ async def act(message: discord.Message, member: discord.Member, verdict: Verdict
                     f"{member.mention} was caught {FLAVOR}, but NOT {ACTION_VERB[ACTION]}: "
                     "the daily limit is used up"
                 )
-                notes.append(
+                problems.append(
                     f"Already acted on {DAILY_LIMIT} account(s) in the last 24 hours, so no "
                     f"{ACTION} this time. Deal with this account by hand."
                 )
                 log.warning("Daily limit of %d reached in %s", DAILY_LIMIT, guild.name)
             else:
                 done, note = await punish(member)
-                notes.append(note)
+                (notes if done == ACTION_VERB[ACTION] else problems).append(note)
                 if done:
                     headline = f"{member.mention} was {done} for {FLAVOR}"
                 else:
@@ -396,42 +397,38 @@ async def act(message: discord.Message, member: discord.Member, verdict: Verdict
             except discord.NotFound:
                 removed += 1
             except discord.HTTPException as exc:
-                notes.append(f"Could not delete in <#{hit.channel_id}>: {exc.text or exc}")
+                problems.append(f"Could not delete in <#{hit.channel_id}>: {exc.text or exc}")
         notes.append(f"Removed {removed} of {len(verdict.hits)} message(s).")
 
-    log.info("Caught %s (%d) in %s: %s", member, member.id, guild.name, " ".join(notes))
+    log.info(
+        "Caught %s (%d) in %s: %s", member, member.id, guild.name, " ".join(problems + notes)
+    )
     if verdict.newly_flagged:
-        await report(message, member, verdict, notes, headline)
+        await report(guild, member, headline, problems)
 
 
 async def report(
-    message: discord.Message,
-    member: discord.Member,
-    verdict: Verdict,
-    notes: list[str],
-    headline: str,
+    guild: discord.Guild, member: discord.Member, headline: str, problems: list[str]
 ) -> None:
-    channel_id = settings.log_channel_id(message.guild.id)
+    """Post the catch in the server's report channel.
+
+    The report is just the headline, who it was, and the footer. A "Needs
+    attention" section is added only when something went wrong.
+    """
+    channel_id = settings.log_channel_id(guild.id)
     if channel_id is None:
         return
-    channel = message.guild.get_channel_or_thread(channel_id)
+    channel = guild.get_channel_or_thread(channel_id)
     if channel is None:
-        log.warning("Report channel %d is not a channel in %s", channel_id, message.guild.name)
+        log.warning("Report channel %d is not a channel in %s", channel_id, guild.name)
         return
 
-    channels = sorted({h.channel_id for h in verdict.hits})
-    names = [a.filename for a in message.attachments]
     embed = discord.Embed(
-        title="Cross-channel spam caught",
         description=f"**{headline}**\n`{member}`, ID `{member.id}`",
         colour=discord.Colour.red(),
     )
-    embed.add_field(name="Channels", value=" ".join(f"<#{c}>" for c in channels), inline=False)
-    if message.content:
-        embed.add_field(name="Text", value=message.content[:500], inline=False)
-    if names:
-        embed.add_field(name="Attachments", value=", ".join(names)[:500], inline=False)
-    embed.add_field(name="Result", value="\n".join(notes)[:1000], inline=False)
+    if problems:
+        embed.add_field(name="Needs attention", value="\n".join(problems)[:1000], inline=False)
     if ACTION == "timeout":
         footer = "The account is probably hijacked. Lift the timeout once its owner has it back."
     else:

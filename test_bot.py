@@ -256,15 +256,33 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.member.ban.await_args.kwargs["delete_message_seconds"], 600)
         self.member.unban.assert_awaited_once()
         self.member.timeout.assert_not_awaited()
-        self.assertIn("Softbanned", self.report_result())
+        # A clean catch reports only the headline, the account and the footer.
+        embed = self.channels[999].send.await_args.kwargs["embed"]
+        self.assertIsNone(embed.title)
+        self.assertEqual(embed.fields, [])
+        self.assertEqual(
+            embed.description, "**<@7> was softbanned for Mr. Beast-ing**\n`" + str(self.member) + "`, ID `7`"
+        )
+        self.assertIn("probably hijacked", embed.footer.text)
 
     async def test_softban_counts_purged_messages_as_removed(self):
         gone = discord.NotFound(MagicMock(status=404, reason="Not Found"), "Unknown Message")
         for cid in (100, 101, 102):
             self.guild.get_channel_or_thread(cid).get_partial_message.return_value.delete.side_effect = gone
+        with patch.object(bot, "ACTION", "softban"), self.assertLogs("crosspost-guard") as logs:
+            await self.spam()
+        self.assertIn("Removed 3 of 3", logs.output[-1])
+
+    async def test_failed_delete_is_reported(self):
+        response = MagicMock(status=403, reason="Forbidden")
+        self.guild.get_channel_or_thread(101).get_partial_message.return_value.delete.side_effect = (
+            discord.Forbidden(response, "Missing Permissions")
+        )
         with patch.object(bot, "ACTION", "softban"):
             await self.spam()
-        self.assertIn("Removed 3 of 3", self.report_result())
+        embed = self.channels[999].send.await_args.kwargs["embed"]
+        self.assertEqual(embed.fields[-1].name, "Needs attention")
+        self.assertIn("Could not delete in <#101>", embed.fields[-1].value)
 
     async def test_softban_reports_a_ban_it_could_not_lift(self):
         response = MagicMock(status=500, reason="Server Error")

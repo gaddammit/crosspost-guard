@@ -100,6 +100,10 @@ All are environment variables. Only `DISCORD_TOKEN` is required.
   within 30 seconds will be caught too.
 - A softban purges everything the account posted in the last `PURGE_MINUTES`, not
   only the posts that triggered it.
+- A report is one line saying what happened, the account's name and ID, and a footer.
+  A "Needs attention" section is added only when something went wrong, such as a
+  softban that failed or a message that could not be deleted. The console log has the
+  full detail for every catch.
 - As a safety rail, the bot softbans or times out at most `DAILY_LIMIT` accounts per
   server in any 24 hours (3 by default). Past that it still deletes the posts and
   reports the catch, but leaves the account alone and says so in the report, so a
