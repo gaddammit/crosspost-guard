@@ -7,10 +7,11 @@ Configuration is by environment variable; see README.md.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -59,6 +60,13 @@ LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0")) or None
 STATE_FILE = Path(os.environ.get("STATE_FILE", "settings.json"))
 # Roles that are never checked. Members with Manage Messages are always skipped.
 EXEMPT_ROLE_IDS = _ids("EXEMPT_ROLE_IDS")
+# Safety rail: the most accounts the bot will softban or time out in one server
+# in any 24 hours. Past that it still deletes and reports, but leaves the
+# account to the moderators. 0 means no limit.
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "3"))
+if DAILY_LIMIT < 0:
+    raise SystemExit("DAILY_LIMIT must be 0 or more.")
+DAY_SECONDS = 24 * 60 * 60
 # After a catch, keep deleting that account's matching posts for this long, in
 # case the softban or timeout failed or messages were already in flight.
 FLAG_SECONDS = 300.0
@@ -132,29 +140,66 @@ class SpamTracker:
 
 
 class Settings:
-    """Each server's report channel as chosen with /modlog, kept in a JSON file."""
+    """What the bot has to remember across restarts, kept in a JSON file: each
+    server's report channel from /modlog, and when it last softbanned or timed
+    someone out there (for DAILY_LIMIT).
+    """
 
     def __init__(self, path: Path):
         self.path = path
         self._log_channels: dict[int, int] = {}
+        self._actions: dict[int, list[float]] = {}
         try:
             saved = json.loads(path.read_text())
-            self._log_channels = {int(g): int(c) for g, c in saved["log_channels"].items()}
+            self._log_channels = {
+                int(g): int(c) for g, c in saved.get("log_channels", {}).items()
+            }
+            self._actions = {
+                int(g): [float(t) for t in times] for g, times in saved.get("actions", {}).items()
+            }
         except FileNotFoundError:
             pass
-        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        except (ValueError, TypeError, AttributeError) as exc:
             raise SystemExit(f"{path} is damaged ({exc!r}). Fix it or delete it.") from exc
+
+    def _save(self) -> None:
+        saved = {
+            "log_channels": {str(g): c for g, c in self._log_channels.items()},
+            "actions": {str(g): times for g, times in self._actions.items() if times},
+        }
+        # Write beside the file and swap it in, so a crash can't leave it half-written.
+        scratch = self.path.with_name(self.path.name + ".tmp")
+        scratch.write_text(json.dumps(saved, indent=2) + "\n")
+        scratch.replace(self.path)
 
     def log_channel_id(self, guild_id: int) -> int | None:
         return self._log_channels.get(guild_id, LOG_CHANNEL_ID)
 
     def set_log_channel(self, guild_id: int, channel_id: int) -> None:
         self._log_channels[guild_id] = channel_id
-        saved = {"log_channels": {str(g): c for g, c in self._log_channels.items()}}
-        # Write beside the file and swap it in, so a crash can't leave it half-written.
-        scratch = self.path.with_name(self.path.name + ".tmp")
-        scratch.write_text(json.dumps(saved, indent=2) + "\n")
-        scratch.replace(self.path)
+        self._save()
+
+    def claim_action(self, guild_id: int, now: float) -> float | None:
+        """Take one of this server's action slots for the last 24 hours.
+
+        Returns a receipt to hand to release_action if the action then fails,
+        or None if DAILY_LIMIT is already used up. The slot is taken before
+        the action is attempted so that simultaneous catches can't both
+        squeeze under the limit.
+        """
+        recent = [t for t in self._actions.get(guild_id, []) if now - t < DAY_SECONDS]
+        self._actions[guild_id] = recent
+        if DAILY_LIMIT and len(recent) >= DAILY_LIMIT:
+            return None
+        recent.append(now)
+        self._save()
+        return now
+
+    def release_action(self, guild_id: int, receipt: float) -> None:
+        times = self._actions.get(guild_id, [])
+        if receipt in times:
+            times.remove(receipt)
+            self._save()
 
 
 def is_suspicious(message: discord.Message) -> bool:
@@ -318,12 +363,25 @@ async def act(message: discord.Message, member: discord.Member, verdict: Verdict
     else:
         # Deal with the account first so it stops posting while we clean up.
         if verdict.newly_flagged:
-            done, note = await punish(member)
-            notes.append(note)
-            if done:
-                headline = f"{member.mention} was {done} for {FLAVOR}"
+            receipt = settings.claim_action(guild.id, time.time())
+            if receipt is None:
+                headline = (
+                    f"{member.mention} was caught {FLAVOR}, but NOT {ACTION_VERB[ACTION]}: "
+                    "the daily limit is used up"
+                )
+                notes.append(
+                    f"Already acted on {DAILY_LIMIT} account(s) in the last 24 hours, so no "
+                    f"{ACTION} this time. Deal with this account by hand."
+                )
+                log.warning("Daily limit of %d reached in %s", DAILY_LIMIT, guild.name)
             else:
-                headline = f"{member.mention} was caught {FLAVOR}, but the {ACTION} failed"
+                done, note = await punish(member)
+                notes.append(note)
+                if done:
+                    headline = f"{member.mention} was {done} for {FLAVOR}"
+                else:
+                    settings.release_action(guild.id, receipt)
+                    headline = f"{member.mention} was caught {FLAVOR}, but the {ACTION} failed"
 
         # A softban has Discord purge these too, so "already gone" counts as removed.
         removed = 0

@@ -92,15 +92,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.guild.name = "Test"
         self.guild.get_channel_or_thread.side_effect = get_channel
 
-        self.member = MagicMock(spec=discord.Member)
-        self.member.id = 7
-        self.member.mention = "<@7>"
-        self.member.bot = False
-        self.member.roles = []
-        self.member.guild_permissions = discord.Permissions.none()
-        self.member.timeout = AsyncMock()
-        self.member.ban = AsyncMock()
-        self.member.unban = AsyncMock()
+        self.member = self.make_member(7)
 
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
@@ -117,8 +109,21 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def post(self, channel_id, message_id, **kw):
-        await bot.on_message(fake_message(self.member, self.guild, channel_id, message_id, **kw))
+    def make_member(self, user_id):
+        member = MagicMock(spec=discord.Member)
+        member.id = user_id
+        member.mention = f"<@{user_id}>"
+        member.bot = False
+        member.roles = []
+        member.guild_permissions = discord.Permissions.none()
+        member.timeout = AsyncMock()
+        member.ban = AsyncMock()
+        member.unban = AsyncMock()
+        return member
+
+    async def post(self, channel_id, message_id, member=None, **kw):
+        member = member or self.member
+        await bot.on_message(fake_message(member, self.guild, channel_id, message_id, **kw))
 
     async def test_spam_is_timed_out_deleted_and_reported(self):
         await self.post(100, 1)
@@ -138,9 +143,61 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.channels[103].get_partial_message.return_value.delete.assert_awaited_once()
         self.channels[999].send.assert_awaited_once()
 
-    async def spam(self):
+    async def spam(self, member=None):
         for i, cid in enumerate((100, 101, 102)):
-            await self.post(cid, i)
+            await self.post(cid, i, member=member)
+
+    async def test_fourth_account_in_a_day_is_not_softbanned(self):
+        members = [self.make_member(n) for n in (11, 12, 13, 14)]
+        with patch.multiple(bot, ACTION="softban", DAILY_LIMIT=3):
+            for member in members:
+                await self.spam(member)
+        for member in members[:3]:
+            member.ban.assert_awaited_once()
+        members[3].ban.assert_not_awaited()
+        members[3].timeout.assert_not_awaited()
+
+        embed = self.channels[999].send.await_args.kwargs["embed"]
+        self.assertEqual(
+            embed.description.splitlines()[0],
+            "**<@14> was caught Mr. Beast-ing, but NOT softbanned: the daily limit is used up**",
+        )
+        self.assertIn("Deal with this account by hand", embed.fields[-1].value)
+        # Its posts are still removed: 4 accounts, one delete each in this channel.
+        self.assertEqual(self.channels[100].get_partial_message.return_value.delete.await_count, 4)
+
+    async def test_limit_applies_to_timeouts_too(self):
+        first, second = self.make_member(11), self.make_member(12)
+        with patch.object(bot, "DAILY_LIMIT", 1):
+            await self.spam(first)
+            await self.spam(second)
+        first.timeout.assert_awaited_once()
+        second.timeout.assert_not_awaited()
+
+    async def test_failed_softban_does_not_use_up_the_limit(self):
+        failing, second = self.make_member(11), self.make_member(12)
+        response = MagicMock(status=403, reason="Forbidden")
+        failing.ban.side_effect = discord.Forbidden(response, "Missing Permissions")
+        with patch.multiple(bot, ACTION="softban", DAILY_LIMIT=1):
+            await self.spam(failing)
+            await self.spam(second)
+        second.ban.assert_awaited_once()
+
+    async def test_dry_run_does_not_use_up_the_limit(self):
+        first, second = self.make_member(11), self.make_member(12)
+        with patch.multiple(bot, ACTION="softban", DAILY_LIMIT=1, DRY_RUN=True):
+            await self.spam(first)
+        with patch.multiple(bot, ACTION="softban", DAILY_LIMIT=1):
+            await self.spam(second)
+        second.ban.assert_awaited_once()
+
+    async def test_zero_means_no_limit(self):
+        members = [self.make_member(n) for n in range(11, 17)]
+        with patch.multiple(bot, ACTION="softban", DAILY_LIMIT=0):
+            for member in members:
+                await self.spam(member)
+        for member in members:
+            member.ban.assert_awaited_once()
 
     def report_result(self):
         return self.channels[999].send.await_args.kwargs["embed"].fields[-1].value
@@ -281,6 +338,34 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(settings.log_channel_id(2), 999)
         with patch.object(bot, "LOG_CHANNEL_ID", None):
             self.assertIsNone(settings.log_channel_id(2))
+
+    def test_limit_is_per_server_and_rolls_over_after_24_hours(self):
+        settings = Settings(self.path)
+        with patch.object(bot, "DAILY_LIMIT", 2):
+            self.assertIsNotNone(settings.claim_action(1, now=0))
+            self.assertIsNotNone(settings.claim_action(1, now=3600))
+            self.assertIsNone(settings.claim_action(1, now=7200))
+            self.assertIsNotNone(settings.claim_action(2, now=7200))  # another server
+            self.assertIsNone(settings.claim_action(1, now=86399))
+            self.assertIsNotNone(settings.claim_action(1, now=86401))  # first one aged out
+
+    def test_limit_survives_a_restart(self):
+        with patch.object(bot, "DAILY_LIMIT", 1):
+            self.assertIsNotNone(Settings(self.path).claim_action(1, now=0))
+            self.assertIsNone(Settings(self.path).claim_action(1, now=60))
+
+    def test_released_slot_can_be_claimed_again(self):
+        settings = Settings(self.path)
+        with patch.object(bot, "DAILY_LIMIT", 1):
+            receipt = settings.claim_action(1, now=0)
+            settings.release_action(1, receipt)
+            self.assertIsNotNone(settings.claim_action(1, now=60))
+
+    def test_file_from_before_the_limit_existed_still_loads(self):
+        self.path.write_text('{"log_channels": {"1": 555}}')
+        settings = Settings(self.path)
+        self.assertEqual(settings.log_channel_id(1), 555)
+        self.assertIsNotNone(settings.claim_action(1, now=0))
 
     def test_damaged_file_stops_startup(self):
         self.path.write_text("{not json")

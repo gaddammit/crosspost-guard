@@ -80,10 +80,11 @@ All are environment variables. Only `DISCORD_TOKEN` is required.
 | --- | --- | --- |
 | `DISCORD_TOKEN` | none | The bot token. |
 | `LOG_CHANNEL_ID` | none | Report channel for servers where `/modlog` hasn't been run. With neither, catches only appear in the console. |
-| `STATE_FILE` | `settings.json` | Where the `/modlog` choices are saved. |
+| `STATE_FILE` | `settings.json` | Where the `/modlog` choices and the `DAILY_LIMIT` count are saved. |
 | `CHANNEL_THRESHOLD` | `3` | How many different channels count as spam. |
 | `WINDOW_SECONDS` | `30` | How quickly those posts have to happen. |
 | `ACTION` | `softban` | `softban` or `timeout`. |
+| `DAILY_LIMIT` | `3` | Most accounts it will softban or time out per server in any 24 hours. `0` removes the limit. |
 | `FLAVOR` | `Mr. Beast-ing` | What the report says they were doing, as in "was softbanned for Mr. Beast-ing". |
 | `PURGE_MINUTES` | `10` | Softban only: how far back Discord purges the account's messages. |
 | `TIMEOUT_HOURS` | `24` | Timeout only: how long. Discord's limit is 28 days (672). |
@@ -99,8 +100,13 @@ All are environment variables. Only `DISCORD_TOKEN` is required.
   within 30 seconds will be caught too.
 - A softban purges everything the account posted in the last `PURGE_MINUTES`, not
   only the posts that triggered it.
-- Apart from the `/modlog` choice, the bot keeps its state in memory, so a restart
-  forgets the last 30 seconds of posts.
+- As a safety rail, the bot softbans or times out at most `DAILY_LIMIT` accounts per
+  server in any 24 hours (3 by default). Past that it still deletes the posts and
+  reports the catch, but leaves the account alone and says so in the report, so a
+  moderator has to deal with it. The count is saved in `settings.json`, so restarting
+  the bot does not reset it.
+- Apart from the `/modlog` choice and that count, the bot keeps its state in memory,
+  so a restart forgets the last 30 seconds of posts.
 
 ## Tests
 
