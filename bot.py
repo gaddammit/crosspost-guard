@@ -238,7 +238,8 @@ settings = Settings(STATE_FILE)
 async def setup_hook() -> None:
     # Register /modlog with Discord. The guard still works if this fails.
     try:
-        await tree.sync()
+        synced = await tree.sync()
+        log.info("Registered with Discord: %s", ", ".join(f"/{c.name}" for c in synced) or "none")
     except discord.HTTPException as exc:
         log.warning("Could not register the /modlog command: %s", exc)
 
