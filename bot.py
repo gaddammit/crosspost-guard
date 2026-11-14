@@ -7,10 +7,13 @@ Configuration is by environment variable; see README.md.
 
 from __future__ import annotations
 
+import base64
+import getpass
 import json
 import logging
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -58,6 +61,11 @@ DRY_RUN = _flag("DRY_RUN", False)
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0")) or None
 # Where the channels chosen with /modlog are remembered.
 STATE_FILE = Path(os.environ.get("STATE_FILE", "settings.json"))
+# Where the token is kept when it is stored behind a passphrase (optional).
+TOKEN_FILE = Path(os.environ.get("TOKEN_FILE", "token.enc"))
+# Work factor for turning the passphrase into a key. Higher is slower to guess.
+SCRYPT_N = 2**17
+MIN_PASSPHRASE = 8
 # Roles that are never checked. Members with Manage Messages are always skipped.
 EXEMPT_ROLE_IDS = _ids("EXEMPT_ROLE_IDS")
 # Safety rail: the most accounts the bot will softban or time out in one server
@@ -440,11 +448,105 @@ async def report(
         log.warning("Could not post the report: %s", exc)
 
 
-def main() -> None:
-    token = os.environ.get("DISCORD_TOKEN")
+def _cipher(passphrase: str, salt: bytes, n: int):
+    try:
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    except ImportError:
+        raise SystemExit(
+            "The passphrase option needs the 'cryptography' package. "
+            "Run the pip install -r requirements.txt step again."
+        ) from None
+    key = Scrypt(salt=salt, length=32, n=n, r=8, p=1).derive(passphrase.encode())
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def encrypt_token(token: str, passphrase: str, n: int = SCRYPT_N) -> dict:
+    """Lock the token with a key derived from the passphrase."""
+    salt = os.urandom(16)
+    return {
+        "kdf": "scrypt",
+        "n": n,
+        "salt": base64.b64encode(salt).decode(),
+        "token": _cipher(passphrase, salt, n).encrypt(token.encode()).decode(),
+    }
+
+
+def decrypt_token(saved: dict, passphrase: str) -> str:
+    """Return the token, or raise ValueError if the passphrase is wrong."""
+    from cryptography.fernet import InvalidToken
+
+    n = int(saved["n"])
+    if saved.get("kdf") != "scrypt" or not 2**14 <= n <= 2**20:
+        raise SystemExit(f"{TOKEN_FILE} is not in a format this version understands.")
+    try:
+        cipher = _cipher(passphrase, base64.b64decode(saved["salt"]), n)
+        return cipher.decrypt(saved["token"].encode()).decode()
+    except InvalidToken:
+        raise ValueError("wrong passphrase") from None
+
+
+def ask_secret(prompt: str) -> str:
+    """Read a secret from the keyboard, hidden where the terminal allows it."""
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    # Some terminals (Git Bash on Windows, for one) can't hide typing.
+    print(f"{prompt}[this terminal can't hide typing, so it will be visible] ", end="", flush=True)
+    return sys.stdin.readline().rstrip("\r\n")
+
+
+def save_encrypted_token() -> None:
+    token = ask_secret("Bot token: ").strip()
     if not token:
-        raise SystemExit("Set DISCORD_TOKEN to your bot token first.")
-    client.run(token, log_level=logging.INFO, root_logger=True)
+        raise SystemExit("No token entered; nothing was saved.")
+    passphrase = ask_secret(f"Choose a passphrase ({MIN_PASSPHRASE}+ characters): ")
+    if len(passphrase) < MIN_PASSPHRASE:
+        raise SystemExit("That passphrase is too short; nothing was saved.")
+    if ask_secret("Type it again: ") != passphrase:
+        raise SystemExit("The passphrases did not match; nothing was saved.")
+    TOKEN_FILE.write_text(json.dumps(encrypt_token(token, passphrase), indent=2) + "\n")
+    print(
+        f"Saved to {TOKEN_FILE}. Now remove DISCORD_TOKEN from your .env file and anywhere "
+        "else it is written down. The bot will ask for the passphrase each time it starts."
+    )
+
+
+def load_token() -> str:
+    """The token from DISCORD_TOKEN, or from TOKEN_FILE after asking for the passphrase."""
+    token = os.environ.get("DISCORD_TOKEN")
+    if token:
+        if TOKEN_FILE.exists():
+            print(
+                f"Note: DISCORD_TOKEN is set, so {TOKEN_FILE} and its passphrase are not being "
+                "used. Remove DISCORD_TOKEN to rely on the passphrase.",
+                file=sys.stderr,
+            )
+        return token
+    if not TOKEN_FILE.exists():
+        raise SystemExit(
+            "No token found. Set DISCORD_TOKEN, or run this with --encrypt-token to store "
+            "the token behind a passphrase."
+        )
+    try:
+        saved = json.loads(TOKEN_FILE.read_text())
+        for attempt in range(3):
+            try:
+                return decrypt_token(saved, ask_secret("Passphrase: "))
+            except ValueError:
+                print("Wrong passphrase.", file=sys.stderr)
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"{TOKEN_FILE} is damaged ({exc!r}). Run --encrypt-token again.") from exc
+    raise SystemExit("Too many wrong passphrases.")
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = sys.argv[1:] if argv is None else argv
+    if args == ["--encrypt-token"]:
+        save_encrypted_token()
+        return
+    if args:
+        raise SystemExit("Usage: python bot.py [--encrypt-token]")
+    client.run(load_token(), log_level=logging.INFO, root_logger=True)
 
 
 if __name__ == "__main__":

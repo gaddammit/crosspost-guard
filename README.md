@@ -72,6 +72,29 @@ You can also set `LOG_CHANNEL_ID` instead. It is used for any server where nobod
 run `/modlog`. To get a channel ID, turn on **Developer Mode** in Discord's Advanced
 settings, then right-click the channel and choose **Copy Channel ID**.
 
+## Optional: keep the token behind a passphrase
+
+Instead of leaving the token readable in a file, you can store it encrypted and type a
+passphrase each time the bot starts.
+
+```bash
+.venv/bin/python bot.py --encrypt-token
+```
+
+It asks for the token and a passphrase, then writes `token.enc`. After that, remove
+`DISCORD_TOKEN` from wherever you had it and start the bot as usual; it will ask for
+the passphrase. On Windows, use `.venv\Scripts\python` instead.
+
+- The bot cannot start without someone typing the passphrase, so this does not suit a
+  service that restarts on its own.
+- It protects the token on disk: a stolen laptop, a backup, a synced copy. It does not
+  protect against malware running on the machine while the bot is running.
+- Some terminals, Git Bash on Windows among them, cannot hide what you type. The bot
+  says so when that is the case.
+- If `DISCORD_TOKEN` is set, it wins and `token.enc` is ignored.
+- If you forget the passphrase, reset the token in the Developer Portal and run
+  `--encrypt-token` again.
+
 ## Settings
 
 All are environment variables. Only `DISCORD_TOKEN` is required.
@@ -81,6 +104,7 @@ All are environment variables. Only `DISCORD_TOKEN` is required.
 | `DISCORD_TOKEN` | none | The bot token. |
 | `LOG_CHANNEL_ID` | none | Report channel for servers where `/modlog` hasn't been run. With neither, catches only appear in the console. |
 | `STATE_FILE` | `settings.json` | Where the `/modlog` choices and the `DAILY_LIMIT` count are saved. |
+| `TOKEN_FILE` | `token.enc` | Where the passphrase-protected token is kept, if you use that option. |
 | `CHANNEL_THRESHOLD` | `3` | How many different channels count as spam. |
 | `WINDOW_SECONDS` | `30` | How quickly those posts have to happen. |
 | `ACTION` | `softban` | `softban` or `timeout`. |

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -450,6 +451,87 @@ class ModlogCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_command_is_limited_to_manage_server_and_servers(self):
         self.assertTrue(bot.modlog.default_permissions.manage_guild)
         self.assertTrue(bot.modlog.guild_only)
+
+
+class TokenTests(unittest.TestCase):
+    FAST = 2**14  # smallest work factor the bot accepts, to keep the tests quick
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "token.enc"
+        patcher = patch.multiple(bot, TOKEN_FILE=self.path, SCRYPT_N=self.FAST)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = patch.dict("os.environ", {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        bot.os.environ.pop("DISCORD_TOKEN", None)
+
+    def save(self, token="abc.def.ghi", passphrase="correct horse"):
+        self.path.write_text(json.dumps(bot.encrypt_token(token, passphrase, n=self.FAST)))
+
+    def test_round_trip(self):
+        saved = bot.encrypt_token("abc.def.ghi", "correct horse", n=self.FAST)
+        self.assertNotIn("abc.def.ghi", json.dumps(saved))
+        self.assertEqual(bot.decrypt_token(saved, "correct horse"), "abc.def.ghi")
+
+    def test_wrong_passphrase_is_rejected(self):
+        saved = bot.encrypt_token("abc.def.ghi", "correct horse", n=self.FAST)
+        with self.assertRaises(ValueError):
+            bot.decrypt_token(saved, "wrong horse")
+
+    def test_same_token_encrypts_differently_each_time(self):
+        first = bot.encrypt_token("abc.def.ghi", "correct horse", n=self.FAST)
+        second = bot.encrypt_token("abc.def.ghi", "correct horse", n=self.FAST)
+        self.assertNotEqual(first["salt"], second["salt"])
+        self.assertNotEqual(first["token"], second["token"])
+
+    def test_environment_token_is_used_when_set(self):
+        bot.os.environ["DISCORD_TOKEN"] = "from-env"
+        self.assertEqual(bot.load_token(), "from-env")
+
+    def test_passphrase_unlocks_the_saved_token(self):
+        self.save()
+        with patch.object(bot, "ask_secret", return_value="correct horse"):
+            self.assertEqual(bot.load_token(), "abc.def.ghi")
+
+    def test_second_attempt_can_succeed(self):
+        self.save()
+        with patch.object(bot, "ask_secret", side_effect=["oops", "correct horse"]):
+            self.assertEqual(bot.load_token(), "abc.def.ghi")
+
+    def test_three_wrong_passphrases_stop_startup(self):
+        self.save()
+        with patch.object(bot, "ask_secret", return_value="oops") as ask:
+            with self.assertRaises(SystemExit):
+                bot.load_token()
+        self.assertEqual(ask.call_count, 3)
+
+    def test_no_token_anywhere_stops_startup(self):
+        with self.assertRaises(SystemExit):
+            bot.load_token()
+
+    def test_damaged_file_stops_startup(self):
+        self.path.write_text("{not json")
+        with self.assertRaises(SystemExit):
+            bot.load_token()
+
+    def test_encrypt_command_saves_a_file_the_bot_can_unlock(self):
+        with patch.object(bot, "ask_secret", side_effect=[" abc.def.ghi ", "correct horse", "correct horse"]):
+            bot.main(["--encrypt-token"])
+        self.assertNotIn("abc.def.ghi", self.path.read_text())
+        with patch.object(bot, "ask_secret", return_value="correct horse"):
+            self.assertEqual(bot.load_token(), "abc.def.ghi")
+
+    def test_encrypt_command_refuses_mismatch_and_short_passphrases(self):
+        with patch.object(bot, "ask_secret", side_effect=["abc.def.ghi", "correct horse", "different"]):
+            with self.assertRaises(SystemExit):
+                bot.main(["--encrypt-token"])
+        with patch.object(bot, "ask_secret", side_effect=["abc.def.ghi", "short"]):
+            with self.assertRaises(SystemExit):
+                bot.main(["--encrypt-token"])
+        self.assertFalse(self.path.exists())
 
 
 if __name__ == "__main__":
